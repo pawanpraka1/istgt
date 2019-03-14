@@ -48,7 +48,8 @@ typedef struct replica_s {
 	pthread_mutex_t r_mtx;
 	replica_state_t state;
 	spec_t *spec;
-	int iofd;
+	int iofd[32];
+	int current_conn_idx;
 	/* management connection descriptor */
 	int mgmt_fd;
 	uint8_t quorum;
@@ -139,7 +140,7 @@ int handle_write_resp(spec_t *, replica_t *);
 int handle_read_resp(spec_t *, replica_t *);
 int update_replica_list(int, spec_t *, int);
 replica_t *create_replica_entry(spec_t *, int, int);
-int update_replica_entry(spec_t *, replica_t *, int);
+int update_replica_entry(spec_t *, replica_t *);
 int handle_read_data_event(replica_t *);
 int handle_write_data_event(replica_t *replica);
 void update_volstate(spec_t *);

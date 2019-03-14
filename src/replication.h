@@ -27,6 +27,8 @@
 
 #include "istgt_lu.h"
 
+extern int num_connections;
+
 /*
  * NOTE : RCMD_MEMPOOL_ENTRIES depends on number of replicas ISGT can support
  * current limit is 524288 per replica. Replica will be able to serve

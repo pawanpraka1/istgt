@@ -209,13 +209,13 @@ inform_mgmt_conn(replica_t *r)
  * fetch command from replica's command queue
  */
 static rcmd_t *
-dequeue_replica_cmdq(replica_t *replica)
+dequeue_replica_cmdq(rte_smempool_t *cmdq)
 {
 	unsigned count = 0;
 
-	count = get_num_entries_from_mempool(&(replica->cmdq));
+	count = get_num_entries_from_mempool(cmdq);
 	if (count)
-		return get_from_mempool(&(replica->cmdq));
+		return get_from_mempool(cmdq);
 	else
 		return NULL;
 }
@@ -238,7 +238,7 @@ respond_with_error_for_all_outstanding_ios(replica_t *r)
 
 	ASSERT(r->data_eventfd == -1);
 
-	while ((rcmd = dequeue_replica_cmdq(r)) != NULL)
+	while ((rcmd = dequeue_replica_cmdq(&(r->cmdq))) != NULL)
 		move_to_blocked_or_ready_q(r, rcmd);
 
 	SEND_ERROR_RESPONSES((&(r->waitq)), r, cond_var, wait_cnt, wait_diff,
@@ -264,16 +264,16 @@ respond_with_error_for_all_outstanding_ios(replica_t *r)
 static int
 handle_data_conn_error(replica_t *r)
 {
-	int fd, data_eventfd, mgmt_eventfd2, epollfd;
+	int data_eventfd, mgmt_eventfd2, epollfd;
 	spec_t *spec;
 	replica_t *r1 = NULL;
 	int found_in_list = 0;
-
+/*
 	if (r->iofd == -1) {
 		REPLICA_ERRLOG("repl %s %d %p data_conn error\n", r->ip, r->port, r);
 		return -1;
 	}
-
+*/
 	MTX_LOCK(&r->spec->rq_mtx);
 	spec = r->spec;
 
@@ -332,12 +332,14 @@ handle_data_conn_error(replica_t *r)
 	MTX_UNLOCK(&spec->rq_mtx);
 
 	MTX_LOCK(&r->r_mtx);
-	(void) epoll_ctl(r->epollfd, EPOLL_CTL_DEL, r->iofd, NULL);
+	for (int i = 0; i < num_connections; i++) {
+		(void) epoll_ctl(r->epollfd, EPOLL_CTL_DEL, r->iofd[i], NULL);
 
-	fd = r->iofd;
-	r->iofd = -1;
-	shutdown(fd, SHUT_RDWR);
-	close(fd);
+		int fd = r->iofd[i];
+		r->iofd[i] = -1;
+		shutdown(fd, SHUT_RDWR);
+		close(fd);
+	}
 
 	data_eventfd = r->data_eventfd;
 	r->data_eventfd = -1;
@@ -401,9 +403,8 @@ find_replica_cmd(replica_t *r, uint64_t ioseq)
  * read response read on replica's data connection
  */
 static int
-read_cmd(replica_t *r)
+read_cmd(replica_t *r, int fd)
 {
-	int fd = r->iofd;
 	int state = r->io_state;
 	zvol_io_hdr_t *resp_hdr = r->io_resp_hdr;
 	uint8_t *resp_data = NULL;
@@ -546,12 +547,13 @@ handle_epoll_out_event(replica_t *r)
 	int ret;
 
 	while ((cmd = TAILQ_FIRST(&r->readyq)) != NULL) {
-		ret = write_cmd(r->iofd, cmd);
+		ret = write_cmd(r->iofd[r->current_conn_idx], cmd);
 		if (ret < 0)
 			return -1;
 		if (ret == WRITE_COMPLETED) {
 			TAILQ_REMOVE(&r->readyq, cmd, next);
 			TAILQ_INSERT_TAIL(&r->waitq, cmd, next);
+			r->current_conn_idx = (r->current_conn_idx + 1) % num_connections;
 			continue;
 		}
 		else {
@@ -566,7 +568,7 @@ handle_epoll_out_event(replica_t *r)
 	(var) += (uint64_t)(d.tv_sec - s.tv_sec) * (uint64_t)SEC_IN_NS + d.tv_nsec - s.tv_nsec;
 
 static int
-handle_epoll_in_event(replica_t *r)
+handle_epoll_in_event(replica_t *r, int fd)
 {
 	int ret, idx;
 	rcommon_cmd_t *rcomm_cmd;
@@ -576,7 +578,7 @@ handle_epoll_in_event(replica_t *r)
 	struct timespec now;
 
 start:
-	ret = read_cmd(r);
+	ret = read_cmd(r, fd);
 	if (ret < 0)
 		return -1;
 
@@ -645,7 +647,7 @@ handle_data_eventfd(void *arg)
 	rcmd_t *cmd;
 	int ret;
 
-	while ((cmd = dequeue_replica_cmdq(r)) != NULL)
+	while ((cmd = dequeue_replica_cmdq(&(r->cmdq))) != NULL)
 		move_to_blocked_or_ready_q(r, cmd);
 	ret = handle_epoll_out_event(r);
 	return ret;
@@ -716,38 +718,14 @@ replica_thread(void *arg)
 
 	ev.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLERR | EPOLLET |
 	    EPOLLRDHUP;
-	ev.data.ptr = NULL;
 
 	MTX_LOCK(&r->r_mtx);
 
-	if ((r->iofd == -1) ||
-	    (epoll_ctl(r_epollfd, EPOLL_CTL_ADD, r->iofd, &ev) == -1)) {
-		MTX_UNLOCK(&r->r_mtx);
-		REPLICA_ERRLOG("epoll error for replica(%s:%d) err(%d)\n",
-		    r->ip, r->port, errno);
-initialize_error:
-		if (r_mgmt_eventfd > 0) {
-			close (r_mgmt_eventfd);
-			r_mgmt_eventfd = -1;
-		}
-
-		if ((r_epollfd > 0) && (r_data_eventfd > 0)) {
-			/*
-			 * epoll_ctl may fail so we are ignoring return
-			 * value of epoll_ctl
-			 */
-			(void) epoll_ctl(r_epollfd, EPOLL_CTL_DEL,
-			    r_data_eventfd, NULL);
-			close(r_epollfd);
-			r->epollfd = -1;
-		}
-
-		if (r_data_eventfd) {
-			close(r_data_eventfd);
-			r->data_eventfd = -1;
-		}
-		return NULL;
+	for (i = 0; i < num_connections; i++) {
+	    ev.data.fd = r->iofd[i];
+	    epoll_ctl(r_epollfd, EPOLL_CTL_ADD, r->iofd[i], &ev);
 	}
+
 
 	r->data_eventfd = r_data_eventfd;
 	r->epollfd = r_epollfd;
@@ -791,12 +769,6 @@ initialize_error:
 			}
 
 			ret = -1;
-			ptr = events[i].data.ptr;
-			if (ptr != NULL) {
-				REPLICA_ERRLOG("event.data.ptr != NULL.. This "
-				    "should not happen.. r(%lu)!\n", r->zvol_guid);
-				goto exit;
-			}
 
 			if (events[i].events & (EPOLLERR | EPOLLRDHUP | EPOLLHUP)) {
 				REPLICA_ERRLOG("Received event(%d) on fd(%d) "
@@ -807,7 +779,7 @@ initialize_error:
 
 			ret = 0;
 			if (events[i].events & EPOLLIN)
-				ret = handle_epoll_in_event(arg);
+				ret = handle_epoll_in_event(arg, events[i].data.fd);
 
 			if (ret == -1)
 				goto exit;
@@ -861,5 +833,28 @@ exit:
 	if (ret == -1)
 		handle_data_conn_error(r);
 	REPLICA_ERRLOG("replica_thread exiting ...\n");
+	return NULL;
+
+initialize_error:
+		if (r_mgmt_eventfd > 0) {
+			close (r_mgmt_eventfd);
+			r_mgmt_eventfd = -1;
+		}
+
+		if ((r_epollfd > 0) && (r_data_eventfd > 0)) {
+			/*
+			 * epoll_ctl may fail so we are ignoring return
+			 * value of epoll_ctl
+			 */
+			(void) epoll_ctl(r_epollfd, EPOLL_CTL_DEL,
+			    r_data_eventfd, NULL);
+			close(r_epollfd);
+			r->epollfd = -1;
+		}
+
+		if (r_data_eventfd) {
+			close(r_data_eventfd);
+			r->data_eventfd = -1;
+		}
 	return NULL;
 }

@@ -12,8 +12,8 @@ run_istgt ()
 		volume_size=10g
 	fi
 
-	[ ! -z $REPLICATION_FACTOR ] && rf=$REPLICATION_FACTOR || rf=3
-	[ ! -z $CONSISTENCY_FACTOR ] && cf=$CONSISTENCY_FACTOR || cf=2
+	[ ! -z $REPLICATION_FACTOR ] && rf=$REPLICATION_FACTOR || rf=1
+	[ ! -z $CONSISTENCY_FACTOR ] && cf=$CONSISTENCY_FACTOR || cf=1
 
 	ulimit -c unlimited
 	rm -rf core

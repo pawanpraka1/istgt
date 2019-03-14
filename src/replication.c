@@ -688,27 +688,23 @@ trigger_rebuild(spec_t *spec)
 
 /*
  * is_replica_newly_connected returns whether the connection is newly created
- * from a familiar replica or newly connected from an unknown replica that
- * target is waiting for.
+ * from a familiar replica or newly connected from an unknown replica.
  * return value :
  *	true  : if the connection is from a familiar replica (which does not
  *		have an active session with the target) or from an unknown
  *		replica for which target is waiting
  *	false : if the connection is from a familiar replica which is already
- *		connected to target or target is not waiting for any new
- *		replica.
+ *		connected to target.
  */
 static bool
 is_replica_newly_connected(spec_t *spec, replica_t *new_replica)
 {
 	known_replica_t *kr = NULL;
-	int familiar_replicas = 0;
 	bool newly_connected = false, found = false;
 
 	ASSERT(MTX_LOCKED(&spec->rq_mtx));
 
 	TAILQ_FOREACH(kr, &spec->identified_replica, next) {
-		familiar_replicas++;
 		if (kr->zvol_guid == new_replica->zvol_guid) {
 			found = true;
 			if (!kr->is_connected) {
@@ -834,7 +830,7 @@ update_volstate(spec_t *spec)
 		    spec->degraded_rcount);
 	} else {
 		spec->ready = false;
-		REPLICA_NOTICELOG("Marking volume(%s) not ready for IOs\n", spec->volname);
+		REPLICA_NOTICELOG("Marking volume(%s) not ready for IOs %d %d %d\n", spec->volname, spec->healthy_rcount , spec->degraded_rcount, spec->consistency_factor);
 	}
 }
 
@@ -1031,7 +1027,7 @@ create_replica_entry(spec_t *spec, int epfd, int mgmt_fd)
 	MTX_UNLOCK(&spec->rq_mtx);
 
 	replica->mgmt_eventfd2 = -1;
-	replica->iofd = -1;
+//	replica->iofd = -1;
 	replica->spec = spec;
 
 	rc = pthread_mutex_init(&replica->r_mtx, NULL);
@@ -1068,17 +1064,11 @@ error:
  *	 executed once only during handshake with replica.
  */
 int
-update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
+update_replica_entry(spec_t *spec, replica_t *replica)
 {
-	int rc;
-	zvol_io_hdr_t *rio_hdr = NULL;
-	pthread_t r_thread;
-	zvol_io_hdr_t *ack_hdr;
 	mgmt_ack_t *ack_data;
-	zvol_op_open_data_t *rio_payload = NULL;
-	int i;
+	int ret = 0;
 
-	ack_hdr = replica->mgmt_io_resp_hdr;	
 	ack_data = (mgmt_ack_t *)replica->mgmt_io_resp_data;
 
 	TAILQ_INIT(&replica->waitq);
@@ -1088,7 +1078,6 @@ update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
 	replica->ongoing_io = NULL;
 	replica->ongoing_io_len = 0;
 	replica->ongoing_io_buf = NULL;
-	replica->iofd = iofd;
 	replica->ip = malloc(strlen(ack_data->ip)+1);
 	strcpy(replica->ip, ack_data->ip);
 	replica->quorum = ack_data->quorum;
@@ -1107,17 +1096,44 @@ update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
 		REPLICA_ERRLOG("replica(ip:%s port:%d "
 		    "guid:%lu) is not permitted to connect\n", replica->ip, replica->port,
 		    replica->zvol_guid);
-		goto replica_error;
+		ret = -1;
+		goto replica_not_permitted_error;
 	}
+
+	if (can_replica_connect(spec, replica) == false) {
+		REPLICA_ERRLOG("Already healthy: %d degraded: %d non_quorum: %d "
+		    "replicas are connected.. disconnecting new replica(ip:%s port:%d "
+		    "guid:%lu) before replica thread creation\n", spec->healthy_rcount,
+		    spec->degraded_rcount, get_non_quorum_replica_count(spec),
+		    replica->ip, replica->port, replica->zvol_guid);
+		MTX_UNLOCK(&spec->rq_mtx);
+		ret = -1;
+		goto replica_not_permitted_error;
+	}
+
 	MTX_UNLOCK(&spec->rq_mtx);
 
 	replica->spec = spec;
+replica_not_permitted_error:
+	return ret;
+}
+
+static int make_data_connection(spec_t *spec, replica_t *replica, int index)
+{
+	int iofd, ret = -1;
+
+	if((iofd = cstor_ops.conn_connect(replica->ip, replica->port)) < 0) {
+		REPLICA_ERRLOG("Failed to open data connection for replica"
+		    "(%s:%d)\n", replica->ip, replica->port);
+		return -1;
+	}
+
 	replica->io_resp_hdr = (zvol_io_hdr_t *) malloc(sizeof (zvol_io_hdr_t));
 	memset(replica->io_resp_hdr, 0, sizeof (zvol_io_hdr_t));
 	replica->io_state = READ_IO_RESP_HDR;
 	replica->io_read = 0;
 
-	rio_hdr = (zvol_io_hdr_t *) malloc(sizeof (zvol_io_hdr_t));
+	zvol_io_hdr_t *rio_hdr = (zvol_io_hdr_t *) malloc(sizeof (zvol_io_hdr_t));
 	memset(rio_hdr, 0, sizeof (zvol_io_hdr_t));
 	rio_hdr->opcode = ZVOL_OPCODE_OPEN;
 	rio_hdr->io_seq = 0;
@@ -1125,7 +1141,7 @@ update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
 	rio_hdr->len = sizeof (zvol_op_open_data_t);
 	rio_hdr->version = REPLICA_VERSION;
 
-	rio_payload = (zvol_op_open_data_t *) malloc(
+	zvol_op_open_data_t *rio_payload = (zvol_op_open_data_t *) malloc(
 	    sizeof (zvol_op_open_data_t));
 	rio_payload->timeout = (3 * replica_timeout);
 	rio_payload->tgt_block_size = spec->blocklen;
@@ -1135,21 +1151,23 @@ update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
 	REPLICA_LOG("replica(%lu) connected successfully from %s:%d\n",
 	    replica->zvol_guid, replica->ip, replica->port);
 
-	if (write(replica->iofd, rio_hdr, sizeof (*rio_hdr)) !=
+	replica->iofd[index] = iofd;
+
+	if (write(replica->iofd[index], rio_hdr, sizeof (*rio_hdr)) !=
 	    sizeof (*rio_hdr)) {
 		REPLICA_ERRLOG("failed to send io hdr to replica(%lu)\n",
 		    replica->zvol_guid);
 		goto replica_error;
 	}
 
-	if (write(replica->iofd, rio_payload, sizeof (zvol_op_open_data_t)) !=
+	if (write(replica->iofd[index], rio_payload, sizeof (zvol_op_open_data_t)) !=
 	    sizeof (zvol_op_open_data_t)) {
 		REPLICA_ERRLOG("failed to send data-open payload to "
 		    "replica(%lu)\n", replica->zvol_guid);
 		goto replica_error;
 	}
 
-	if (read(replica->iofd, rio_hdr, sizeof (*rio_hdr)) !=
+	if (read(replica->iofd[index], rio_hdr, sizeof (*rio_hdr)) !=
 	    sizeof (*rio_hdr)) {
 		REPLICA_ERRLOG("failed to read data-open response from "
 		    "replica(%lu)\n", replica->zvol_guid);
@@ -1162,77 +1180,37 @@ update_replica_entry(spec_t *spec, replica_t *replica, int iofd)
 		goto replica_error;
 	}
 
-	if (init_mempool(&replica->cmdq, rcmd_mempool_count, 0, 0,
-	    "replica_cmd_mempool", NULL, NULL, NULL, false)) {
-		REPLICA_ERRLOG("Failed to initialize replica(%lu) cmdq\n",
-		    replica->zvol_guid);
-		goto replica_error;
-	}
-
-	rc = make_socket_non_blocking(iofd);
+	int rc = make_socket_non_blocking(iofd);
 	if (rc == -1) {
 		REPLICA_ERRLOG("make_socket_non_blocking() failed for"
 		    " replica(%lu)\n", replica->zvol_guid);
 		goto replica_error;
 	}
 
-	MTX_LOCK(&spec->rq_mtx);
-	if (can_replica_connect(spec, replica) == false) {
-		REPLICA_ERRLOG("Already healthy: %d degraded: %d non_quorum: %d "
-		    "replicas are connected.. disconnecting new replica(ip:%s port:%d "
-		    "guid:%lu) before replica thread creation\n", spec->healthy_rcount,
-		    spec->degraded_rcount, get_non_quorum_replica_count(spec),
-		    replica->ip, replica->port, replica->zvol_guid);
-		MTX_UNLOCK(&spec->rq_mtx);
-		goto replica_error;
+	ret = 0;
+replica_error:
+	return ret;
+}
+
+static int post_data_connections(spec_t *spec, replica_t *replica)
+{
+	pthread_t r_thread;
+	if (init_mempool(&replica->cmdq, rcmd_mempool_count, 0, 0,
+	    "replica_cmd_mempool", NULL, NULL, NULL, false)) {
+		REPLICA_ERRLOG("Failed to initialize replica(%lu) cmdq\n",
+		    replica->zvol_guid);
+		return -1;
 	}
 
-	MTX_UNLOCK(&spec->rq_mtx);
-
-	rc = pthread_create(&r_thread, NULL, &replica_thread,
+	int rc = pthread_create(&r_thread, NULL, &replica_thread,
 			(void *)replica);
 	if (rc != 0) {
 		REPLICA_ERRLOG("pthread_create(r_thread) failed for "
 		    "replica(%lu)\n", replica->zvol_guid);
-replica_error:
-		destroy_mempool(&replica->cmdq);
-		replica->iofd = -1;
-		close(iofd);
-		if (rio_hdr)
-			free(rio_hdr);
-		if (rio_payload)
-			free(rio_payload);
 		return -1;
 	}
-
-	free(rio_hdr);
-	free(rio_payload);
 
 	MTX_LOCK(&spec->rq_mtx);
-	MTX_LOCK(&replica->r_mtx);
-	for (i = 0; (i < 10) && (replica->mgmt_eventfd2 == -1); i++) {
-		MTX_UNLOCK(&replica->r_mtx);
-		sleep(1);
-		MTX_LOCK(&replica->r_mtx);
-	}
-
-	if (replica->mgmt_eventfd2 == -1) {
-		REPLICA_ERRLOG("unable to set mgmteventfd2 for more than 10 "
-		    "seconds for replica(%lu)\n", replica->zvol_guid);
-		/*
-		 * as this function doesn't run in parallel with handle_mgmt_conn
-		 * for given replica, its fine to set these values to -1 here.
-		 */
-error_out_replica:
-		replica->dont_free = 1;
-		replica->iofd = -1;
-		MTX_UNLOCK(&replica->r_mtx);
-		MTX_UNLOCK(&spec->rq_mtx);
-		shutdown(iofd, SHUT_RDWR);
-		close(iofd);
-		return -1;
-	}
-
 	/*
 	 * After can_replica_connect check above, 
          * there might be any non_quorum replicas became healthy. 
@@ -1249,9 +1227,9 @@ error_out_replica:
 		    "guid:%lu)\n", spec->healthy_rcount, spec->degraded_rcount,
 		    get_non_quorum_replica_count(spec), replica->ip, replica->port,
 		    replica->zvol_guid);
-		goto error_out_replica;
+		MTX_UNLOCK(&spec->rq_mtx);
+		return -1;
 	}
-	MTX_UNLOCK(&replica->r_mtx);
 
 	TAILQ_REMOVE(&spec->rwaitq, replica, r_waitnext);
 
@@ -2018,13 +1996,13 @@ disconnect_all_non_quorum_replicas:
 	return 0;
 }
 
+int num_connections = 3;
 /*
  * forms data connection to replica, updates replica entry
  */
 int
 zvol_handshake(spec_t *spec, replica_t *replica)
 {
-	int rc, iofd;
 	zvol_io_hdr_t *ack_hdr;
 	mgmt_ack_t *ack_data;
 
@@ -2044,15 +2022,17 @@ zvol_handshake(spec_t *spec, replica_t *replica)
 		return -1;
 	}
 
-	if((iofd = cstor_ops.conn_connect(ack_data->ip, ack_data->port)) < 0) {
-		REPLICA_ERRLOG("Failed to open data connection for replica"
-		    "(%s:%d)\n", replica->ip, replica->port);
+	if (update_replica_entry(spec, replica) != 0)
 		return -1;
-	}
 
-	rc = update_replica_entry(spec, replica, iofd);
 
-	return rc;
+	/* TODO: Below have blocking calls which happens in init_replication thread */
+	for (int i = 0; i < num_connections; i++)
+		make_data_connection(spec, replica, i);
+
+
+	post_data_connections(spec, replica);
+	return 0;
 }
 
 /*
@@ -2323,7 +2303,7 @@ read_io_resp_hdr:
 				case ZVOL_OPCODE_HANDSHAKE:
 					VERIFY3U(resp_hdr->len, ==, sizeof (mgmt_ack_t));
 					/* dont process handshake on data connection */
-					ASSERT(fd != replica->iofd);
+//					ASSERT(fd != replica->iofd);
 
 					rc = zvol_handshake(spec, replica);
 
@@ -2338,7 +2318,7 @@ read_io_resp_hdr:
 				case ZVOL_OPCODE_REPLICA_STATUS:
 					VERIFY3U(resp_hdr->len, ==, sizeof (zrepl_status_ack_t));
 					/* replica status must come from mgmt connection */
-					ASSERT(fd != replica->iofd);
+//					ASSERT(fd != replica->iofd);
 
 					update_replica_status(spec, replica);
 					free(*resp_data);
@@ -2352,7 +2332,7 @@ read_io_resp_hdr:
 				case ZVOL_OPCODE_PREPARE_FOR_REBUILD:
 				
 					/* replica status must come from mgmt connection */
-					assert(fd != replica->iofd);
+//					assert(fd != replica->iofd);
 					handle_prepare_for_rebuild_resp(spec, resp_hdr, *resp_data, mgmt_cmd);
 					free(*resp_data);
 					break;
@@ -2362,12 +2342,12 @@ read_io_resp_hdr:
 					 * snap create response must come from
 					 * mgmt connection
 					 */
-					assert(fd != replica->iofd);
+//					assert(fd != replica->iofd);
 					handle_snap_create_resp(replica, mgmt_cmd);
 					break;
 
 				case ZVOL_OPCODE_START_REBUILD:
-					assert(fd != replica->iofd);
+//					assert(fd != replica->iofd);
 					handle_start_rebuild_resp(spec, resp_hdr);
 					break;
 
@@ -2740,11 +2720,14 @@ replicate(ISTGT_LU_DISK *spec, ISTGT_LU_CMD_Ptr cmd, uint64_t offset, uint64_t n
 	int iovcnt = cmd->iobufindx + 1;
 	bool replica_choosen = false;
 	struct timespec abstime, now, queued_time, diff;
-	int nsec, err_num = 0;
+	int nsec;
 	int skip_count = 0;
 	uint64_t num_read_ios = 0;
 	uint64_t inflight_read_ios = 0;
-	int count = 0 ;
+	int count = 0;
+#ifdef DEBUG
+	int err_num;
+#endif
 	bool replica_exists;
 
 	(void) cmd_read;
@@ -2948,7 +2931,9 @@ wait_for_other_responses:
 		MTX_LOCK(rcomm_cmd->mutex);
 		rc = pthread_cond_timedwait(rcomm_cmd->cond_var,
 		    rcomm_cmd->mutex, &abstime);
+#ifdef	DEBUG
 		err_num = errno;
+#endif
 		MTX_UNLOCK(rcomm_cmd->mutex);
 	}
 
@@ -2983,6 +2968,7 @@ handle_mgmt_conn_error(replica_t *r, int sfd, struct epoll_event *events, int ev
 		 * sending is successful but error from zvol_handshake or
 		 * data connection is closed before this
 		 */
+#if 0
 		if ((r->iofd == -1) || (r->mgmt_eventfd2 == -1)) {
 			TAILQ_FOREACH(r_ev, &(r->spec->rwaitq), r_waitnext) {
 				if (r_ev == r) {
@@ -2995,6 +2981,7 @@ handle_mgmt_conn_error(replica_t *r, int sfd, struct epoll_event *events, int ev
 				}
 			}
 		}
+#endif
 		if (r->mgmt_eventfd2 != -1) {
 			REPLICA_NOTICELOG("Informing data connection for error "
 			    "in replica(%lu)\n", r->zvol_guid);
